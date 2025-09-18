@@ -129,7 +129,7 @@ async def deduct_time_from_store(userid, corporateid, seconds=1):
 
 # ------------------ Gemini Key Management ------------------
 async def get_gemini_keys():
-    resp = await http_client.get("https://apikey.com")
+    resp = await http_client.get("https://www.mivwordhouse.com")
     keys = resp.json()
     if not hasattr(get_gemini_keys, "key_usage"):
         get_gemini_keys.key_usage = {}
