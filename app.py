@@ -129,8 +129,17 @@ async def deduct_time_from_store(userid, corporateid, seconds=1):
 
 # ------------------ Gemini Key Management ------------------
 async def get_gemini_keys():
-    resp = await http_client.get("https://www.mivwordhouse.com")
+    resp = await http_client.get("https://www.mivwordhouse.com", follow_redirects=True)
+
+if resp.status_code != 200:
+    logging.error(f"Failed to fetch keys: {resp.status_code} {resp.text}")
+    return []
+
+try:
     keys = resp.json()
+except Exception as e:
+    logging.error(f"Invalid JSON response from key service: {e}")
+    return []
     if not hasattr(get_gemini_keys, "key_usage"):
         get_gemini_keys.key_usage = {}
         for k in keys:
