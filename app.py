@@ -206,14 +206,15 @@ def create_gemini_config(voice, language, summaries, worktype, industry, languag
         system_instruction.append(f"User wants to learn {languagelearning}")
 
     config = types.LiveConnectConfig(
-        response_modalities=["AUDIO", "TEXT", "VIDEO"],
+        response_modalities=["AUDIO",],
         speech_config=types.SpeechConfig(
             language_code=language,
             voice_config=types.VoiceConfig(
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
             )
         ),
-        system_instruction=types.Content(parts=[types.Part.from_text(text="; ".join(system_instruction))]),
+        system_instruction=types.Content(parts=[types.Part.from_text(text="; ".join(system_instruction))],
+        role="user"),
     )
     return config
 
@@ -246,7 +247,6 @@ async def dashboard():
     """
     return HTMLResponse(html_content)
 
-@app.websocket("/ws")
 @app.websocket("/ws")
 async def dashboard_ws(websocket: WebSocket):
     origin = websocket.headers.get("origin")
@@ -427,7 +427,10 @@ async def run_gemini_session(key, model, config, initial_frontend_ws, userid, co
                             return 'explicit_end'
                         if 'audio' in data:
                             try:
-                                await session.send(input=base64.b64decode(data['audio']))
+                                await session.send(input={
+                                    "data": base64.b64decode(data['audio']),
+                                    "mime_type": "audio/pcm"
+                                })
                             except Exception as e:
                                 logging.exception(f"Failed to send audio to gemini for {session_key}: {e}")
                         if 'text' in data:
@@ -441,4 +444,385 @@ async def run_gemini_session(key, model, config, initial_frontend_ws, userid, co
                                 video_out_queue.put_nowait({"mime_type": "image/jpeg", "data": data['image']})
                             except asyncio.QueueFull:
                                 logging.warning("Video queue full, skipping frontend frame")
-          
+                    except asyncio.TimeoutError:
+                        # periodic wake to check stop_event
+                        continue
+                    except Exception as e:
+                        logging.info(f"Frontend websocket recv error for {session_key}: {e}")
+                        async with active_sessions_lock:
+                            ctx['frontend_ws'] = None
+                            frontend_reconnections[session_key] = frontend_reconnections.get(session_key, 0) + 1
+                            ctx['waiting_for_reconnect'] = True
+                            ctx['disconnect_time'] = time.time()
+
+            # receive gemini output and forward to frontend
+            async def forward_to_frontend():
+                nonlocal seconds_spent
+                ctx = active_sessions[session_key]
+                first_output_seen = False
+                last_tick = None
+                active_seconds = 0
+
+                async for turn in session.receive():
+                    if stop_event.is_set():
+                        logging.info(f"forward_to_frontend stopping due to stop_event for {session_key}")
+                        break
+
+                    out_msg = {}
+                    if turn.text:
+                        out_msg['text'] = turn.text
+                    if turn.data:
+                        out_msg['audio'] = base64.b64encode(turn.data).decode()
+                    if out_msg:
+                        ws = ctx.get('frontend_ws')
+                        if ws:
+                            try:
+                                await ws.send(json.dumps(out_msg))
+                            except Exception as e:
+                                logging.info(f"Failed to send to frontend for {session_key}: {e}")
+                                ctx['frontend_ws'] = None
+                                frontend_reconnections[session_key] = frontend_reconnections.get(session_key, 0) + 1
+                                ctx['waiting_for_reconnect'] = True
+                                ctx['disconnect_time'] = time.time()
+                                continue
+                    # Start counting active time after first Gemini output
+                    if not first_output_seen:
+                        gemini_started_event.set()
+                        last_tick = time.time()
+                        first_output_seen = True
+
+                    # Update active_seconds regardless of frontend disconnection
+                    now = time.time()
+                    if last_tick:
+                        active_seconds += now - last_tick
+                    last_tick = now
+
+                seconds_spent = int(active_seconds)
+
+
+
+            # video sending (non-blocking capture)
+            async def send_video_frames(video_out_queue, stop_event):
+                while True:
+                    if stop_event.is_set():
+                        logging.info("send_video_frames stopping due to stop_event")
+                        return
+                    frame = await video_out_queue.get()  # queue receives frontend frames
+                    try:
+                        # send frame to Gemini
+                        await session.send(input={
+                            "data": base64.b64decode(frame['data']),
+                            "mime_type": "image/jpeg"
+                        })
+                    except Exception as e:
+                        logging.exception(f"Failed to send video frame to gemini: {e}")
+
+
+            # replace:
+            # ded_task = asyncio.create_task(deduction_loop())
+            # session_ctx['deduction_task'] = ded_task
+            ded_task = asyncio.create_task(start_in_memory_deduction(session_key, userid, corporateid))
+            async with active_sessions_lock:
+                session_ctx['deduction_task'] = ded_task
+            # main I/O loop
+            end_reason = None
+            try:
+
+                # Shield the forward_to_frontend task to prevent losing messages
+                io_tasks = [
+                    asyncio.create_task(send_from_frontend()),
+                    asyncio.create_task(asyncio.shield(forward_to_frontend())),
+                    asyncio.create_task(send_video_frames(video_out_queue, stop_event))
+                ]
+
+                done, pending = await asyncio.wait(io_tasks, return_when=asyncio.FIRST_COMPLETED)
+
+                for t in pending:
+                    if not t.cancelled() and not t.done():
+                        t.cancel()
+                        try:
+                            await t
+                        except asyncio.CancelledError:
+                            pass
+
+                for t in done:
+                    try:
+                        res = t.result()
+                    except asyncio.CancelledError:
+                        res = None
+                    if res == 'explicit_end':
+                        end_reason = 'explicit_end'
+                    elif res == 'disconnected':
+                        end_reason = 'disconnected'
+                    elif res == 'stop':
+                        end_reason = 'stop'
+            except Exception as e:
+                logging.exception(f"I/O error in session {session_key}: {e}")
+
+            # if disconnected, wait up to RECONNECT_TIMEOUT for frontend to reconnect (unless stop_event set)
+            if end_reason == 'disconnected' and not stop_event.is_set():
+                logging.info(f"User {session_key} disconnected, waiting up to {RECONNECT_TIMEOUT}s for reconnect...")
+                wait_start = time.time()
+                reconnected = False
+                while time.time() - wait_start < RECONNECT_TIMEOUT:
+                    if stop_event.is_set():
+                        logging.info(f"Stop event set while waiting for reconnect for {session_key}")
+                        break
+                    ctx = active_sessions.get(session_key)
+                    if not ctx:
+                        break
+                    if ctx.get('frontend_ws') is not None:
+                        reconnected = True
+                        ctx['waiting_for_reconnect'] = False
+                        ctx['disconnect_time'] = None
+                        logging.info(f"User {session_key} reconnected")
+                        # resume IO by re-invoking the IO coroutines
+                        try:
+                            io_tasks = [
+                                asyncio.create_task(send_from_frontend()),
+                                asyncio.create_task(forward_to_frontend()),
+                                asyncio.create_task(send_video_frames(video_out_queue, stop_event))
+                            ]
+                            done, pending = await asyncio.wait(io_tasks, return_when=asyncio.FIRST_COMPLETED)
+                            for t in pending:
+                                t.cancel()
+                            for t in done:
+                                try:
+                                    res = t.result()
+                                except asyncio.CancelledError:
+                                    res = None
+                                if res == 'explicit_end':
+                                    end_reason = 'explicit_end'
+                                    break
+                                elif res == 'disconnected':
+                                    end_reason = 'disconnected'
+                                    break
+                                elif res == 'stop':
+                                    end_reason = 'stop'
+                                    break
+                        except Exception:
+                            pass
+                        if end_reason in ('explicit_end', 'disconnected', 'stop'):
+                            break
+                    await asyncio.sleep(0.5)
+                if not reconnected:
+                    logging.info(f"User {session_key} failed to reconnect within timeout")
+
+            # If stop_event is set (quota exhaustion or explicit end), ensure it's noted
+            if stop_event.is_set() and not end_reason:
+                end_reason = 'stop'
+
+            # Ask Gemini for a final summary (if possible)
+            summary_text = ""
+            try:
+                await session.send(input="Give me summary of what has been discussed", end_of_turn=True)
+
+                async def collect_summary():
+                    parts = []
+                    async for resp in session.receive():
+                        if resp.text:
+                            parts.append(resp.text)
+                        if getattr(resp, "event", None) == "turn_complete":
+                            break
+                    return " ".join(parts)
+
+                summary_text = await asyncio.wait_for(collect_summary(), timeout=30.0)
+            except asyncio.TimeoutError:
+                logging.warning(f"Timeout while waiting for summary from Gemini for {session_key}")
+                summary_text = "Summary request timed out."
+            except Exception as e:
+                logging.exception(f"Failed to get summary from gemini for {session_key}: {e}")
+                summary_text = ""
+
+
+            # cancel deduction task and ensure no more deductions
+            # inside finally block in run_gemini_session
+            if session_ctx.get('deduction_task'):
+                try:
+                    session_ctx['deduction_stop_event'].set()
+                    session_ctx['deduction_task'].cancel()
+                except Exception:
+                    pass
+
+            # seconds_spent already being tracked by forward_to_frontend updates; ensure integer
+            seconds_spent = int(seconds_spent)
+
+            logging.info(f"User {session_key} session ended. Seconds spent: {seconds_spent}, reason: {end_reason}")
+
+            return summary_text, seconds_spent
+
+    except Exception as e:
+        traceback.print_exc()
+        return "", seconds_spent
+    finally:
+        await release_gemini_session(key, model)
+        # cleanup active_sessions entry
+        async with active_sessions_lock:
+            if session_key in active_sessions:
+                try:
+                    t = active_sessions[session_key].get('deduction_task')
+                    if t:
+                        t.cancel()
+                except Exception:
+                    pass
+                del active_sessions[session_key]
+
+# ------------------ Frontend Handler ------------------
+ALLOWED_ORIGINS = ["http://localhost", "http://127.0.0.1", "https://live.com"]
+
+async def frontend_handler(websocket):
+    origin = websocket.request_headers.get("Origin")
+    if origin not in ALLOWED_ORIGINS:
+        # Reject connection
+        await websocket.close(code=4003)  # 4003 = Forbidden
+        return
+
+    try:
+        data = json.loads(await websocket.recv())
+
+        # --- Required fields ---
+        required_fields = ["voicepreference", "languagepreference", "languagelearning", "userid", "summary"]
+        for field in required_fields:
+            if field not in data or data[field] is None:
+                await websocket.send(json.dumps({"error": f"missing_field:{field}"}))
+                await websocket.close()
+                return
+
+        userid = data.get("userid")
+        corporateid = data.get("corporateid")
+        worktype = data.get("worktype")
+        industry = data.get("industry")
+
+        # --- Rules for corporateid, worktype, industry ---
+        if corporateid:
+            if not (worktype or industry):
+                await websocket.send(json.dumps({"error": "corporateid_requires_worktype_or_industry"}))
+                await websocket.close()
+                return
+        else:
+            if worktype or industry:
+                await websocket.send(json.dumps({"error": "worktype_or_industry_requires_corporateid"}))
+                await websocket.close()
+                return
+
+        # Compute session key used to track reconnections
+        s_key = session_key_for(userid, corporateid)
+        if not s_key:
+            await websocket.close()
+            return
+
+        # Authorization / plan checks
+        if userid and not corporateid:
+            paidplan, freetier = await get_user_plan(userid)
+            if paidplan == 0 and freetier == 0:
+                await websocket.send(json.dumps({"error": "quota_exhausted"}))
+                await websocket.close()
+                return
+        if userid and corporateid:
+            paidplan = await get_user_plan(userid, corporateid)
+            if paidplan < 144000:
+                await websocket.send(json.dumps({"error": "quota_exhausted"}))
+                await websocket.close()
+                return
+
+
+        # If there's an existing active session that is waiting for reconnection, attach
+        # --- In frontend_handler, before reconnect handling ---
+        async with active_sessions_lock:
+            existing = active_sessions.get(s_key)
+            if existing and existing.get('waiting_for_reconnect'):
+                if 'reconnect_lock' not in existing:
+                    existing['reconnect_lock'] = asyncio.Lock()
+            else:
+                existing = None
+
+        reconnect_lock = existing.get('reconnect_lock')
+        async with reconnect_lock:
+            # Only one coroutine enters this block at a time
+            if existing.get('frontend_ws') is not None:
+                await websocket.send(json.dumps({"error": "another_reconnect_in_progress"}))
+                await websocket.close()
+                return
+
+            # Validate payload
+            if userid != existing['info'].get('userid') or corporateid != existing['info'].get('corporateid'):
+                await websocket.send(json.dumps({"error": "invalid_reconnect"}))
+                await websocket.close()
+                return
+
+            logging.info(f"Attaching reconnecting websocket to existing session {s_key}")
+            existing['frontend_ws'] = websocket
+            existing['waiting_for_reconnect'] = False
+            existing['disconnect_time'] = None
+
+
+        try:
+            await websocket.wait_closed()
+        finally:
+            async with active_sessions_lock:
+                if active_sessions.get(s_key):
+                    active_sessions[s_key]['frontend_ws'] = None
+
+        # otherwise this is a fresh connection: obtain key and start session
+        key, model = await queue_handler(websocket, data)
+        if not key:
+            return
+
+        config = create_gemini_config(
+            voice=data.get("voicepreference", "Puck"),
+            language=data.get("languagepreference", "en-US"),
+            summaries=data.get("summary", []),
+            worktype=data.get("worktype"),
+            industry=data.get("industry"),
+            languagelearning=data.get("languagelearning"),
+        )
+
+        # register a minimal session context so reconnections can be attached
+        async with active_sessions_lock:
+            active_sessions[s_key] = {'frontend_ws': websocket, 'info': {'userid': userid, 'corporateid': corporateid}, 'started_at': time.time()}
+
+        summary_text, seconds_spent = await run_gemini_session(key, model, config, websocket, userid, corporateid, s_key)
+
+        # Post-processing after session end
+        languagelearning = data.get('languagelearning')
+        async def post_with_retry(url, json_data, retries=3, delay=2):
+            for attempt in range(1, retries + 1):
+                try:
+                    resp = await http_client.post(url, json=json_data)
+                    if resp.status_code < 400:
+                        return True
+                    logging.warning(f"Post attempt {attempt} to {url} failed with status {resp.status_code}")
+                except Exception as e:
+                    logging.warning(f"Post attempt {attempt} to {url} failed: {e}")
+                await asyncio.sleep(delay * attempt)  # exponential backoff
+            logging.error(f"Failed to post to {url} after {retries} attempts")
+            return False
+
+        # ---- Replacement patch ----
+        try:
+            if userid and corporateid:
+                await post_with_retry(f"https://summary.com/summarysession/{userid}/", {"summary": summary_text, "time": seconds_spent, "language": languagelearning})
+                await post_with_retry(f"https://corporate.com/{corporateid}/", {"time": seconds_spent, "languagelearning": languagelearning})
+            elif userid and not corporateid:
+                await post_with_retry(f"https://summary.com/summarysession/{userid}/", {"summary": summary_text, "time": seconds_spent, "language": languagelearning})
+        except Exception as e:
+            logging.exception(f"Unexpected error during post-processing for {s_key}: {e}")
+
+
+    except websockets.exceptions.ConnectionClosed:
+        pass
+    except Exception as e:
+        traceback.print_exc()
+# ------------------ Main ------------------
+async def main():
+    await get_gemini_keys()
+    asyncio.create_task(monitor_dashboard())
+    async with websockets.serve(frontend_handler, "0.0.0.0", 8765):
+        logging.info("Server started on ws://0.0.0.0:8765")
+        config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
+        server = uvicorn.Server(config)
+        await server.serve()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
