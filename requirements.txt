@@ -10,8 +10,6 @@ redis==6.4.0             # async support in redis-py v5+
 # Google Gemini SDK
 google-genai==1.38.0      # or latest from PyPI
 
-# Audio processing
-pyaudio==0.2.14          # May require system dependencies to install
 
 # Image processing
 pillow==11.3.0           # For PIL.Image
