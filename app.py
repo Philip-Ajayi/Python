@@ -17,7 +17,6 @@ import uvicorn
 
 from google import genai
 from google.genai import types
-import pyaudio
 from PIL import Image
 import mss
 
@@ -33,13 +32,11 @@ r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 http_client = httpx.AsyncClient(timeout=30.0)
 
 # ------------------ Config ------------------
-FORMAT = pyaudio.paInt16
 CHANNELS = 1
 SEND_SAMPLE_RATE = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE = 1024
 
-DEFAULT_VIDEO_MODE = "camera"
 MAX_SESSIONS_PER_MODEL = 3
 RECONNECT_TIMEOUT = 300  # seconds to allow frontend to reconnect
 QUEUE_TIMEOUT = 60  # max wait time for queue
@@ -87,19 +84,22 @@ if KEYS[1] ~= "" then
     free = tonumber(redis.call("GET", KEYS[1]) or "0")
 end
 
-if free > 0 then
-    local deduct = math.min(free, tonumber(ARGV[1]))
-    redis.call("DECRBY", KEYS[1], deduct)
-    return {"free", deduct}
+local paid = tonumber(redis.call("GET", KEYS[2]) or "0")
+if paid > 0 then
+    -- deduct paid first
+    local deduct = math.min(paid, tonumber(ARGV[1]))
+    redis.call("DECRBY", KEYS[2], deduct)
+    return {"paid", deduct}
 else
-    local paid = tonumber(redis.call("GET", KEYS[2]) or "0")
-    if paid > 0 then
-        local deduct = math.min(paid, tonumber(ARGV[1]))
-        redis.call("DECRBY", KEYS[2], deduct)
-        return {"paid", deduct}
-    else
-        return {"none", 0}
+    if KEYS[1] ~= "" then
+        local free = tonumber(redis.call("GET", KEYS[1]) or "0")
+        if free > 0 then
+            local deduct = math.min(free, tonumber(ARGV[1]))
+            redis.call("DECRBY", KEYS[1], deduct)
+            return {"free", deduct}
+        end
     end
+    return {"none", 0}
 end
 """
 
